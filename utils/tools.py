@@ -3,14 +3,32 @@ import datetime
 import os
 import urllib.parse
 import ipaddress
-from urllib.parse import urlparse
 import socket
-from utils.config import config, resource_path
+from utils.config import config
+import utils.constants as constants
 import re
 from bs4 import BeautifulSoup
 from flask import render_template_string, send_file
 import shutil
 import requests
+import sys
+import logging
+from logging.handlers import RotatingFileHandler
+
+
+def get_logger(path, level=logging.ERROR, init=False):
+    """
+    get the logger
+    """
+    if not os.path.exists(constants.output_dir):
+        os.makedirs(constants.output_dir)
+    if init and os.path.exists(path):
+        os.remove(path)
+    handler = RotatingFileHandler(path, encoding="utf-8")
+    logger = logging.getLogger(path)
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    return logger
 
 
 def format_interval(t):
@@ -70,7 +88,7 @@ def filter_by_date(data):
     Filter by date and limit
     """
     default_recent_days = 30
-    use_recent_days = config.getint("Settings", "recent_days", fallback=30)
+    use_recent_days = config.recent_days
     if not isinstance(use_recent_days, int) or use_recent_days <= 0:
         use_recent_days = default_recent_days
     start_date = datetime.datetime.now() - datetime.timedelta(days=use_recent_days)
@@ -87,11 +105,10 @@ def filter_by_date(data):
         else:
             unrecent_data.append(item)
     recent_data_len = len(recent_data)
-    urls_limit = config.getint("Settings", "urls_limit", fallback=30)
     if recent_data_len == 0:
         recent_data = unrecent_data
-    elif recent_data_len < urls_limit:
-        recent_data.extend(unrecent_data[: urls_limit - len(recent_data)])
+    elif recent_data_len < config.urls_limit:
+        recent_data.extend(unrecent_data[: config.urls_limit - len(recent_data)])
     return recent_data
 
 
@@ -122,77 +139,100 @@ def get_resolution_value(resolution_str):
         return 0
 
 
-def get_total_urls_from_info_list(infoList):
+def get_total_urls_from_info_list(infoList, ipv6=False):
     """
     Get the total urls from info list
     """
-    open_filter_resolution = config.getboolean(
-        "Settings", "open_filter_resolution", fallback=True
-    )
-    ipv_type_prefer = [
-        type.strip().lower()
-        for type in config.get("Settings", "ipv_type_prefer", fallback="ipv4").split(
-            ","
-        )
-    ]
-    origin_type_prefer = [
-        origin.strip().lower()
-        for origin in config.get(
-            "Settings",
-            "origin_type_prefer",
-            fallback="hotel,multicast,subscribe,online_search",
-        ).split(",")
-    ]
-
-    source_limits = {
-        "hotel": config.getint("Settings", "hotel_num", fallback=10),
-        "multicast": config.getint("Settings", "multicast_num", fallback=10),
-        "subscribe": config.getint("Settings", "subscribe_num", fallback=10),
-        "online_search": config.getint("Settings", "online_search_num", fallback=10),
-    }
-
-    min_resolution = get_resolution_value(
-        config.get("Settings", "min_resolution", fallback="1920x1080")
-    )
-
+    ipv_type_prefer = list(config.ipv_type_prefer)
+    if "自动" in ipv_type_prefer or "auto" in ipv_type_prefer or not ipv_type_prefer:
+        ipv_type_prefer = ["ipv6", "ipv4"] if ipv6 else ["ipv4", "ipv6"]
+    origin_type_prefer = config.origin_type_prefer
     categorized_urls = {
         origin: {"ipv4": [], "ipv6": []} for origin in origin_type_prefer
     }
 
+    total_urls = []
     for url, _, resolution, origin in infoList:
-        if open_filter_resolution and resolution:
-            resolution_value = get_resolution_value(resolution)
-            if resolution_value < min_resolution:
-                continue
-
-        if not origin or origin.lower() not in origin_type_prefer:
+        if not origin:
             continue
 
-        if ipv_type_prefer == "ipv6" and "IPv6" in url:
+        if origin == "important":
+            im_url, _, im_info = url.partition("$")
+            im_info_value = im_info.partition("!")[2]
+            total_urls.append(f"{im_url}${im_info_value}" if im_info_value else im_url)
+            continue
+
+        if origin == "subscribe" and "/rtp/" in url:
+            origin = "multicast"
+
+        if origin not in origin_type_prefer:
+            continue
+
+        if config.open_filter_resolution and resolution:
+            resolution_value = get_resolution_value(resolution)
+            if resolution_value < config.min_resolution_value:
+                continue
+
+        pure_url, _, info = url.partition("$")
+        if not info:
+            origin_name = constants.origin_map[origin]
+            if origin_name:
+                url = add_url_info(pure_url, origin_name)
+
+        url_is_ipv6 = is_ipv6(url)
+        if url_is_ipv6:
+            url = add_url_info(url, "IPv6")
+
+        if resolution:
+            url = add_url_info(url, resolution)
+
+        if url_is_ipv6:
             categorized_urls[origin]["ipv6"].append(url)
         else:
             categorized_urls[origin]["ipv4"].append(url)
 
-    total_urls = []
+    ipv_num = {
+        "ipv4": 0,
+        "ipv6": 0,
+    }
+    urls_limit = config.urls_limit
     for origin in origin_type_prefer:
+        if len(total_urls) >= urls_limit:
+            break
         for ipv_type in ipv_type_prefer:
-            total_urls.extend(
-                categorized_urls[origin][ipv_type][: source_limits[origin]]
-            )
+            if len(total_urls) >= urls_limit:
+                break
+            if ipv_num[ipv_type] < config.ipv_limit[ipv_type]:
+                limit = min(
+                    config.source_limits[origin] - ipv_num[ipv_type],
+                    config.ipv_limit[ipv_type] - ipv_num[ipv_type],
+                )
+                urls = categorized_urls[origin][ipv_type][:limit]
+                total_urls.extend(urls)
+                ipv_num[ipv_type] += len(urls)
+            else:
+                continue
 
-    urls_limit = config.getint("Settings", "urls_limit", fallback=30)
     ipv_type_total = list(dict.fromkeys(ipv_type_prefer + ["ipv4", "ipv6"]))
     if len(total_urls) < urls_limit:
         for origin in origin_type_prefer:
-            for ipv_type in ipv_type_total:
-                extra_urls = categorized_urls[origin][ipv_type][source_limits[origin] :]
-                total_urls.extend(extra_urls)
-                if len(total_urls) >= urls_limit:
-                    break
             if len(total_urls) >= urls_limit:
                 break
+            for ipv_type in ipv_type_total:
+                if len(total_urls) >= urls_limit:
+                    break
+                extra_urls = categorized_urls[origin][ipv_type][
+                    : config.source_limits[origin]
+                ]
+                total_urls.extend(extra_urls)
+                total_urls = list(dict.fromkeys(total_urls))[:urls_limit]
 
-    return list(dict.fromkeys(total_urls))[:urls_limit]
+    total_urls = list(dict.fromkeys(total_urls))[:urls_limit]
+
+    if not config.open_url_info:
+        return [url.partition("$")[0] for url in total_urls]
+    else:
+        return total_urls
 
 
 def get_total_urls_from_sorted_data(data):
@@ -200,12 +240,11 @@ def get_total_urls_from_sorted_data(data):
     Get the total urls with filter by date and depulicate from sorted data
     """
     total_urls = []
-    urls_limit = config.getint("Settings", "urls_limit", fallback=30)
-    if len(data) > urls_limit:
+    if len(data) > config.urls_limit:
         total_urls = [url for (url, _, _, _), _ in filter_by_date(data)]
     else:
         total_urls = [url for (url, _, _, _), _ in data]
-    return list(dict.fromkeys(total_urls))[:urls_limit]
+    return list(dict.fromkeys(total_urls))[: config.urls_limit]
 
 
 def is_ipv6(url):
@@ -233,7 +272,7 @@ def check_ipv6_support():
             return True
     except Exception:
         pass
-    print("Your network does not support IPv6, using proxy instead")
+    print("Your network does not support IPv6")
     return False
 
 
@@ -241,51 +280,28 @@ def check_url_ipv_type(url):
     """
     Check if the url is compatible with the ipv type in the config
     """
-    ipv_type = config.get("Settings", "ipv_type", fallback="全部")
-    if ipv_type == "ipv4":
-        return not is_ipv6(url)
-    elif ipv_type == "ipv6":
-        return is_ipv6(url)
-    else:
-        return True
-
-
-def check_by_domain_blacklist(url):
-    """
-    Check by domain blacklist
-    """
-    domain_blacklist = [
-        (parsed_domain.netloc if parsed_domain.scheme else stripped_domain)
-        for domain in config.get("Settings", "domain_blacklist", fallback="").split(",")
-        if (stripped_domain := domain.strip())
-        and (parsed_domain := urlparse(stripped_domain))
-    ]
-    return urlparse(url).netloc not in domain_blacklist
+    ipv6 = is_ipv6(url)
+    ipv_type = config.ipv_type
+    return (
+        (ipv_type == "ipv4" and not ipv6)
+        or (ipv_type == "ipv6" and ipv6)
+        or ipv_type == "全部"
+        or ipv_type == "all"
+    )
 
 
 def check_by_url_keywords_blacklist(url):
     """
     Check by URL blacklist keywords
     """
-    url_keywords_blacklist = [
-        keyword.strip()
-        for keyword in config.get(
-            "Settings", "url_keywords_blacklist", fallback=""
-        ).split(",")
-        if keyword.strip()
-    ]
-    return not any(keyword in url for keyword in url_keywords_blacklist)
+    return not any(keyword in url for keyword in config.url_keywords_blacklist)
 
 
 def check_url_by_patterns(url):
     """
     Check the url by patterns
     """
-    return (
-        check_url_ipv_type(url)
-        and check_by_domain_blacklist(url)
-        and check_by_url_keywords_blacklist(url)
-    )
+    return check_url_ipv_type(url) and check_by_url_keywords_blacklist(url)
 
 
 def filter_urls_by_patterns(urls):
@@ -293,7 +309,6 @@ def filter_urls_by_patterns(urls):
     Filter urls by patterns
     """
     urls = [url for url in urls if check_url_ipv_type(url)]
-    urls = [url for url in urls if check_by_domain_blacklist(url)]
     urls = [url for url in urls if check_by_url_keywords_blacklist(url)]
     return urls
 
@@ -347,9 +362,9 @@ def convert_to_m3u():
     """
     Convert result txt to m3u format
     """
-    user_final_file = config.get("Settings", "final_file", fallback="output/result.txt")
-    if os.path.exists(resource_path(user_final_file)):
-        with open(resource_path(user_final_file), "r", encoding="utf-8") as file:
+    user_final_file = resource_path(config.final_file)
+    if os.path.exists(user_final_file):
+        with open(user_final_file, "r", encoding="utf-8") as file:
             m3u_output = '#EXTM3U x-tvg-url="https://live.fanmingming.com/e.xml"\n'
             current_group = None
             for line in file:
@@ -359,8 +374,8 @@ def convert_to_m3u():
                         current_group = trimmed_line.replace(",#genre#", "").strip()
                     else:
                         try:
-                            original_channel_name, channel_link = map(
-                                str.strip, trimmed_line.split(",", 1)
+                            original_channel_name, _, channel_link = map(
+                                str.strip, trimmed_line.partition(",")
                             )
                         except:
                             continue
@@ -374,81 +389,139 @@ def convert_to_m3u():
                         if current_group:
                             m3u_output += f' group-title="{current_group}"'
                         m3u_output += f",{original_channel_name}\n{channel_link}\n"
-            m3u_file_path = os.path.splitext(resource_path(user_final_file))[0] + ".m3u"
+            m3u_file_path = os.path.splitext(user_final_file)[0] + ".m3u"
             with open(m3u_file_path, "w", encoding="utf-8") as m3u_file:
                 m3u_file.write(m3u_output)
-            print(f"Result m3u file generated at: {m3u_file_path}")
+            print(f"✅ M3U result file generated at: {m3u_file_path}")
 
 
-def get_result_file_content(show_result=False):
+def get_result_file_content(show_content=False, file_type=None):
     """
     Get the content of the result file
     """
-    user_final_file = config.get("Settings", "final_file", fallback="output/result.txt")
-    if config.getboolean("Settings", "open_m3u_result", fallback=True):
-        user_final_file = os.path.splitext(resource_path(user_final_file))[0] + ".m3u"
-        if show_result == False:
-            return send_file(user_final_file, as_attachment=True)
-    with open(user_final_file, "r", encoding="utf-8") as file:
-        content = file.read()
+    user_final_file = resource_path(config.final_file)
+    result_file = (
+        os.path.splitext(user_final_file)[0] + f".{file_type}"
+        if file_type
+        else user_final_file
+    )
+    if os.path.exists(result_file):
+        if config.open_m3u_result:
+            if file_type == "m3u" or not file_type:
+                result_file = os.path.splitext(user_final_file)[0] + ".m3u"
+            if file_type != "txt" and show_content == False:
+                return send_file(result_file, as_attachment=True)
+        with open(result_file, "r", encoding="utf-8") as file:
+            content = file.read()
+    else:
+        content = constants.waiting_tip
     return render_template_string(
         "<head><link rel='icon' href='{{ url_for('static', filename='images/favicon.ico') }}' type='image/x-icon'></head><pre>{{ content }}</pre>",
         content=content,
     )
 
 
-def remove_duplicates_from_tuple_list(tuple_list, seen, flag=None):
+def remove_duplicates_from_tuple_list(tuple_list, seen, flag=None, force_str=None):
     """
     Remove duplicates from tuple list
     """
     unique_list = []
     for item in tuple_list:
-        part = item[0] if flag is None else item[0].rsplit(flag, 1)[-1]
+        item_first = item[0]
+        part = item_first
+        if force_str:
+            info = item_first.partition("$")[2]
+            if info and info.startswith(force_str):
+                continue
+        if flag:
+            matcher = re.search(flag, item_first)
+            if matcher:
+                part = matcher.group(1)
         if part not in seen:
             seen.add(part)
             unique_list.append(item)
     return unique_list
 
 
-def process_nested_dict(data, seen, flag=None):
+def process_nested_dict(data, seen, flag=None, force_str=None):
     """
     Process nested dict
     """
     for key, value in data.items():
         if isinstance(value, dict):
-            process_nested_dict(value, seen, flag)
+            process_nested_dict(value, seen, flag, force_str)
         elif isinstance(value, list):
-            data[key] = remove_duplicates_from_tuple_list(value, seen, flag)
+            data[key] = remove_duplicates_from_tuple_list(value, seen, flag, force_str)
 
 
-ip_pattern = re.compile(
-    r"""
-    (
-        (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})       # IPv4
-        |([a-zA-Z0-9.-]+\.[a-zA-Z]{2,})            # Domain
-        |(\[([0-9a-fA-F:]+)\])                     # IPv6
-    )
-    (?::(\d+))?                                    # Port
-    """,
-    re.VERBOSE,
+url_domain_pattern = re.compile(
+    r"\b((https?):\/\/)?(\[[0-9a-fA-F:]+\]|([\w-]+\.)+[\w-]+)(:[0-9]{1,5})?\b"
 )
 
 
-def get_ip(url):
+def get_url_domain(url):
     """
-    Get the IP address with flags
+    Get the url domain
     """
-    matcher = ip_pattern.search(url)
+    matcher = url_domain_pattern.search(url)
     if matcher:
-        return matcher.group(1)
+        return matcher.group()
     return None
+
+
+def add_url_info(url, info):
+    """
+    Add url info to the URL
+    """
+    if info:
+        separator = "-" if "$" in url else "$"
+        url += f"{separator}{info}"
+    return url
 
 
 def format_url_with_cache(url, cache=None):
     """
     Format the URL with cache
     """
-    if not cache:
-        cache = get_ip(url) or ""
+    cache = cache or get_url_domain(url) or ""
+    return add_url_info(url, f"cache:{cache}") if cache else url
 
-    return f"{url}$cache:{cache}"
+
+def remove_cache_info(str):
+    """
+    Remove the cache info from the string
+    """
+    return re.sub(r"[^a-zA-Z\u4e00-\u9fa5\$]?cache:.*", "", str)
+
+
+def resource_path(relative_path, persistent=False):
+    """
+    Get the resource path
+    """
+    base_path = os.path.abspath(".")
+    total_path = os.path.join(base_path, relative_path)
+    if persistent or os.path.exists(total_path):
+        return total_path
+    else:
+        try:
+            base_path = sys._MEIPASS
+            return os.path.join(base_path, relative_path)
+        except Exception:
+            return total_path
+
+
+def write_content_into_txt(content, path=None, newline=True, callback=None):
+    """
+    Write content into txt file
+    """
+    if not path:
+        return
+
+    with open(path, "a", encoding="utf-8") as f:
+        if newline:
+            f.write(f"\n{content}")
+        else:
+            f.write(content)
+
+    if callback:
+        callback()

@@ -1,11 +1,10 @@
-from asyncio import create_task, gather
-from utils.speed import get_speed
+from utils.config import config
+import utils.constants as constants
 from utils.channel import (
     get_results_from_multicast_soup,
     get_results_from_multicast_soup_requests,
 )
 from utils.tools import get_pbar_remaining, get_soup
-from utils.config import config
 from updates.proxy import get_proxy, get_proxy_next
 from time import time
 from driver.setup import setup_driver
@@ -14,7 +13,6 @@ from utils.retry import (
     retry_func,
     find_clickable_element_with_retry,
 )
-from selenium.webdriver.common.by import By
 from tqdm.asyncio import tqdm_asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from requests_custom.utils import get_soup_requests, close_session
@@ -24,33 +22,32 @@ from updates.subscribe import get_channels_by_subscribe_urls
 from collections import defaultdict
 import updates.fofa.fofa_map as fofa_map
 
+if config.open_driver:
+    try:
+        from selenium.webdriver.common.by import By
+    except:
+        pass
+
 
 async def get_channels_by_hotel(callback=None):
     """
     Get the channels by multicase
     """
     channels = {}
-    pageUrl = "http://tonkiang.us/hoteliptv.php"
+    pageUrl = constants.foodie_hotel_url
     proxy = None
-    open_proxy = config.getboolean("Settings", "open_proxy", fallback=False)
-    open_driver = config.getboolean("Settings", "open_driver", fallback=True)
-    page_num = config.getint("Settings", "hotel_page_num", fallback=3)
-    region_list = [
-        region.strip()
-        for region in config.get(
-            "Settings", "hotel_region_list", fallback="全部"
-        ).split(",")
-        if region.strip()
-    ]
+    open_proxy = config.open_proxy
+    open_driver = config.open_driver
+    page_num = config.hotel_page_num
+    region_list = config.hotel_region_list
     if "all" in region_list or "ALL" in region_list or "全部" in region_list:
-        fofa_region_name_list = list(getattr(fofa_map, "region_url").keys())
-        region_list = fofa_region_name_list
+        region_list = list(getattr(fofa_map, "region_url").keys())
     if open_proxy:
         proxy = await get_proxy(pageUrl, best=True, with_test=True)
     start_time = time()
 
     def process_region_by_hotel(region):
-        nonlocal proxy, open_driver, page_num
+        nonlocal proxy
         name = f"{region}"
         info_list = []
         driver = None
@@ -60,7 +57,7 @@ async def get_channels_by_hotel(callback=None):
                 try:
                     retry_func(
                         lambda: driver.get(pageUrl),
-                        name=f"Tonkiang hotel search:{name}",
+                        name=f"Foodie hotel search:{name}",
                     )
                 except Exception as e:
                     if open_proxy:
@@ -77,7 +74,7 @@ async def get_channels_by_hotel(callback=None):
                 try:
                     page_soup = retry_func(
                         lambda: get_soup_requests(pageUrl, data=post_form, proxy=proxy),
-                        name=f"Tonkiang hotel search:{name}",
+                        name=f"Foodie hotel search:{name}",
                     )
                 except Exception as e:
                     if open_proxy:
@@ -85,7 +82,7 @@ async def get_channels_by_hotel(callback=None):
                     page_soup = get_soup_requests(pageUrl, data=post_form, proxy=proxy)
                 if not page_soup:
                     print(f"{name}:Request fail.")
-                    return {"region": region, "type": type, "data": info_list}
+                    return info_list
                 else:
                     a_tags = page_soup.find_all("a", href=True)
                     for a_tag in a_tags:
@@ -153,15 +150,15 @@ async def get_channels_by_hotel(callback=None):
             pbar.update()
             if callback:
                 callback(
-                    f"正在获取Tonkiang酒店源, 剩余{region_list_len - pbar.n}个地区待查询, 预计剩余时间: {get_pbar_remaining(n=pbar.n, total=pbar.total, start_time=start_time)}",
+                    f"正在获取Foodie酒店源, 剩余{region_list_len - pbar.n}个地区待查询, 预计剩余时间: {get_pbar_remaining(n=pbar.n, total=pbar.total, start_time=start_time)}",
                     int((pbar.n / region_list_len) * 100),
                 )
-            return {"region": region, "type": type, "data": info_list}
+            return info_list
 
     region_list_len = len(region_list)
-    pbar = tqdm_asyncio(total=region_list_len, desc="Tonkiang hotel search")
+    pbar = tqdm_asyncio(total=region_list_len, desc="Foodie hotel search")
     if callback:
-        callback(f"正在获取Tonkiang酒店源, 共{region_list_len}个地区", 0)
+        callback(f"正在获取Foodie酒店源, 共{region_list_len}个地区", 0)
     search_region_result = defaultdict(list)
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {
@@ -172,22 +169,20 @@ async def get_channels_by_hotel(callback=None):
         for future in as_completed(futures):
             region = futures[future]
             result = future.result()
-            data = result.get("data")
 
-            if data:
-                for item in data:
+            if result:
+                for item in result:
                     url = item.get("url")
                     date = item.get("date")
                     if url:
                         search_region_result[region].append((url, date, None))
     urls = [
-        f"http://{url}/ZHGXTV/Public/json/live_interface.txt"
-        for result in search_region_result.values()
+        {region: region, url: f"http://{url}/ZHGXTV/Public/json/live_interface.txt"}
+        for region, result in search_region_result.items()
         for url, _, _ in result
     ]
-    open_sort = config.getboolean("Settings", "open_sort", fallback=True)
     channels = await get_channels_by_subscribe_urls(
-        urls, hotel=True, retry=False, error_print=False, with_cache=open_sort
+        urls, hotel=True, retry=False, error_print=False
     )
     if not open_driver:
         close_session()

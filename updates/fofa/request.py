@@ -1,42 +1,41 @@
-from utils.config import config, resource_path
-from tqdm.asyncio import tqdm_asyncio
-from time import time
-from requests import get
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import updates.fofa.fofa_map as fofa_map
-from driver.setup import setup_driver
-import re
-from utils.retry import retry_func
-from utils.channel import format_channel_name
-from utils.tools import merge_objects, get_pbar_remaining
-from updates.proxy import get_proxy, get_proxy_next
-from requests_custom.utils import get_source_requests, close_session
-from collections import defaultdict
 import pickle
+import re
 import threading
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from time import time
 
-timeout = config.getint("Settings", "request_timeout", fallback=10)
+from requests import get
+from tqdm.asyncio import tqdm_asyncio
+
+import updates.fofa.fofa_map as fofa_map
+import utils.constants as constants
+from requests_custom.utils import get_source_requests, close_session
+from updates.proxy import get_proxy, get_proxy_next
+from utils.channel import format_channel_name
+from utils.config import config
+from utils.retry import retry_func
+from utils.tools import merge_objects, get_pbar_remaining, add_url_info, resource_path
 
 
 def get_fofa_urls_from_region_list():
     """
     Get the FOFA url from region
     """
-    region_list = [
-        region.strip()
-        for region in config.get(
-            "Settings", "hotel_region_list", fallback="全部"
-        ).split(",")
-        if region.strip()
-    ]
     urls = []
     region_url = getattr(fofa_map, "region_url")
+    region_list = config.hotel_region_list
     if "all" in region_list or "ALL" in region_list or "全部" in region_list:
-        urls = [url for url_list in region_url.values() for url in url_list if url]
+        urls = [
+            (url, region)
+            for region, url_list in region_url.items()
+            for url in url_list
+            if url
+        ]
     else:
         for region in region_list:
             if region in region_url:
-                urls.append(region_url[region])
+                urls.extend([(url, region) for url in region_url[region] if url])
     return urls
 
 
@@ -47,23 +46,25 @@ def update_fofa_region_result_tmp(result, multicast=False):
     tmp_result = get_fofa_region_result_tmp(multicast=multicast)
     total_result = merge_objects(tmp_result, result)
     with open(
-        resource_path(
-            f"updates/fofa/fofa_{'multicast' if multicast else 'hotel'}_region_result.pkl"
-        ),
-        "wb",
+            resource_path(
+                f"updates/fofa/fofa_{'multicast' if multicast else 'hotel'}_region_result.pkl"
+            ),
+            "wb",
     ) as file:
         pickle.dump(total_result, file)
 
 
 def get_fofa_region_result_tmp(multicast: False):
-    with open(
-        resource_path(
-            f"updates/fofa/fofa_{'multicast' if multicast else 'hotel'}_region_result.pkl"
-        ),
-        "rb",
-    ) as file:
-        result = pickle.load(file)
-        return result
+    try:
+        with open(
+                resource_path(
+                    f"updates/fofa/fofa_{'multicast' if multicast else 'hotel'}_region_result.pkl"
+                ),
+                "rb",
+        ) as file:
+            return pickle.load(file)
+    except:
+        return {}
 
 
 async def get_channels_by_fofa(urls=None, multicast=False, callback=None):
@@ -74,7 +75,7 @@ async def get_channels_by_fofa(urls=None, multicast=False, callback=None):
     fofa_urls_len = len(fofa_urls)
     pbar = tqdm_asyncio(
         total=fofa_urls_len,
-        desc=f"Processing fofa {'for multicast' if multicast else 'for hotel'}",
+        desc=f"Processing fofa for {'multicast' if multicast else 'hotel'}",
     )
     start_time = time()
     fofa_results = {}
@@ -85,19 +86,22 @@ async def get_channels_by_fofa(urls=None, multicast=False, callback=None):
             0,
         )
     proxy = None
-    open_proxy = config.getboolean("Settings", "open_proxy", fallback=False)
-    open_driver = config.getboolean("Settings", "open_driver", fallback=True)
-    open_sort = config.getboolean("Settings", "open_sort", fallback=True)
+    open_proxy = config.open_proxy
+    open_driver = config.open_driver
+    if open_driver:
+        from driver.setup import setup_driver
+    open_sort = config.open_sort
     if open_proxy:
-        test_url = fofa_urls[0][0] if multicast else fofa_urls[0]
+        test_url = fofa_urls[0][0]
         proxy = await get_proxy(test_url, best=True, with_test=True)
     cancel_event = threading.Event()
+    hotel_name = constants.origin_map["hotel"]
 
     def process_fofa_channels(fofa_info):
-        nonlocal proxy, fofa_urls_len, open_driver, open_sort, cancel_event
+        nonlocal proxy
         if cancel_event.is_set():
             return {}
-        fofa_url = fofa_info[0] if multicast else fofa_info
+        fofa_url = fofa_info[0]
         results = defaultdict(lambda: defaultdict(list))
         driver = None
         try:
@@ -117,7 +121,7 @@ async def get_channels_by_fofa(urls=None, multicast=False, callback=None):
                 page_source = retry_func(
                     lambda: get_source_requests(fofa_url), name=fofa_url
                 )
-            if "资源访问每天限制" in page_source:
+            if any(keyword in page_source for keyword in ["访问异常", "禁止访问", "资源访问每天限制"]):
                 cancel_event.set()
                 raise ValueError("Limited access to fofa page")
             fofa_source = re.sub(r"<!--.*?-->", "", page_source, flags=re.DOTALL)
@@ -130,7 +134,13 @@ async def get_channels_by_fofa(urls=None, multicast=False, callback=None):
             else:
                 with ThreadPoolExecutor(max_workers=100) as executor:
                     futures = [
-                        executor.submit(process_fofa_json_url, url, open_sort)
+                        executor.submit(
+                            process_fofa_json_url,
+                            url,
+                            fofa_info[1],
+                            open_sort,
+                            hotel_name,
+                        )
                         for url in urls
                     ]
                     for future in futures:
@@ -183,7 +193,7 @@ async def get_channels_by_fofa(urls=None, multicast=False, callback=None):
     return fofa_results
 
 
-def process_fofa_json_url(url, open_sort):
+def process_fofa_json_url(url, region, open_sort, hotel_name="酒店源"):
     """
     Process the FOFA json url
     """
@@ -194,7 +204,7 @@ def process_fofa_json_url(url, open_sort):
         #     lambda: get(final_url, timeout=timeout),
         #     name=final_url,
         # )
-        response = get(final_url, timeout=timeout)
+        response = get(final_url, timeout=config.request_timeout)
         try:
             json_data = response.json()
             if json_data["code"] == 0:
@@ -205,9 +215,14 @@ def process_fofa_json_url(url, open_sort):
                             item_url = item.get("url").strip()
                             if item_name and item_url:
                                 total_url = (
-                                    f"{url}{item_url}$cache:{url}"
+                                    add_url_info(
+                                        f"{url}{item_url}",
+                                        f"{region}{hotel_name}-cache:{url}",
+                                    )
                                     if open_sort
-                                    else f"{url}{item_url}"
+                                    else add_url_info(
+                                        f"{url}{item_url}", f"{region}{hotel_name}"
+                                    )
                                 )
                                 if item_name not in channels:
                                     channels[item_name] = [(total_url, None, None)]

@@ -5,13 +5,15 @@ sys.path.append(os.path.dirname(sys.path[0]))
 import tkinter as tk
 from tkinter import messagebox
 from PIL import Image, ImageTk
-from utils.config import config, resource_path, save_config, copy_config
+from utils.config import config
+from utils.tools import resource_path
 from main import UpdateSource
 import asyncio
 import threading
 import webbrowser
 from about import AboutUI
 from default import DefaultUI
+from prefer import PreferUI
 from multicast import MulticastUI
 from hotel import HotelUI
 from subscribe import SubscribeUI
@@ -28,6 +30,7 @@ class TkinterUI:
         self.version = info.get("version", "")
         self.about_ui = AboutUI()
         self.default_ui = DefaultUI()
+        self.prefer_ui = PreferUI()
         self.multicast_ui = MulticastUI()
         self.hotel_ui = HotelUI()
         self.subscribe_ui = SubscribeUI()
@@ -55,19 +58,18 @@ class TkinterUI:
             "response_time_weight": self.default_ui.response_time_weight_scale.get(),
             "resolution_weight": self.default_ui.resolution_weight_scale.get(),
             "ipv_type": self.default_ui.ipv_type_combo.get(),
-            "domain_blacklist": self.default_ui.domain_blacklist_text.get(1.0, tk.END),
             "url_keywords_blacklist": self.default_ui.url_keywords_blacklist_text.get(
                 1.0, tk.END
             ),
             "open_subscribe": self.subscribe_ui.open_subscribe_var.get(),
             "subscribe_urls": self.subscribe_ui.subscribe_urls_text.get(1.0, tk.END),
             "open_multicast": self.multicast_ui.open_multicast_var.get(),
-            "open_multicast_tonkiang": self.multicast_ui.open_multicast_tonkiang_var.get(),
+            "open_multicast_foodie": self.multicast_ui.open_multicast_foodie_var.get(),
             "open_multicast_fofa": self.multicast_ui.open_multicast_fofa_var.get(),
             "multicast_region_list": self.multicast_ui.region_list_combo.get(),
             "multicast_page_num": self.multicast_ui.page_num_entry.get(),
             "open_hotel": self.hotel_ui.open_hotel_var.get(),
-            "open_hotel_tonkiang": self.hotel_ui.open_hotel_tonkiang_var.get(),
+            "open_hotel_foodie": self.hotel_ui.open_hotel_foodie_var.get(),
             "open_hotel_fofa": self.hotel_ui.open_hotel_fofa_var.get(),
             "hotel_region_list": self.hotel_ui.region_list_combo.get(),
             "hotel_page_num": self.hotel_ui.page_num_entry.get(),
@@ -79,11 +81,12 @@ class TkinterUI:
 
         for key, value in config_values.items():
             config.set("Settings", key, str(value))
-        save_config()
+        config.save()
         messagebox.showinfo("提示", "保存成功")
 
     def change_state(self, state):
         self.default_ui.change_entry_state(state=state)
+        self.prefer_ui.change_entry_state(state=state)
         self.multicast_ui.change_entry_state(state=state)
         self.hotel_ui.change_entry_state(state=state)
         self.subscribe_ui.change_entry_state(state=state)
@@ -109,8 +112,9 @@ class TkinterUI:
             self.progress_label.pack_forget()
 
     def on_run_update(self):
+        loop = asyncio.new_event_loop()
+
         def run_loop():
-            loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             loop.run_until_complete(self.run_update())
 
@@ -148,6 +152,7 @@ class TkinterUI:
         notebook.pack(fill="both", padx=10, pady=5)
 
         frame_default = tk.ttk.Frame(notebook)
+        frame_prefer = tk.ttk.Frame(notebook)
         frame_hotel = tk.ttk.Frame(notebook)
         frame_multicast = tk.ttk.Frame(notebook)
         frame_subscribe = tk.ttk.Frame(notebook)
@@ -157,6 +162,10 @@ class TkinterUI:
             resource_path("static/images/settings_icon.png")
         ).resize((16, 16))
         settings_icon = ImageTk.PhotoImage(settings_icon_source)
+        prefer_icon_source = Image.open(
+            resource_path("static/images/prefer_icon.png")
+        ).resize((16, 16))
+        prefer_icon = ImageTk.PhotoImage(prefer_icon_source)
         hotel_icon_source = Image.open(
             resource_path("static/images/hotel_icon.png")
         ).resize((16, 16))
@@ -177,6 +186,7 @@ class TkinterUI:
         notebook.add(
             frame_default, text="通用设置", image=settings_icon, compound=tk.LEFT
         )
+        notebook.add(frame_prefer, text="偏好设置", image=prefer_icon, compound=tk.LEFT)
         notebook.add(frame_hotel, text="酒店源", image=hotel_icon, compound=tk.LEFT)
         notebook.add(
             frame_multicast, text="组播源", image=multicast_icon, compound=tk.LEFT
@@ -186,18 +196,20 @@ class TkinterUI:
         )
         notebook.add(
             frame_online_search,
-            text="在线搜索",
+            text="关键字搜索",
             image=online_search_icon,
             compound=tk.LEFT,
         )
 
         notebook.settings_icon = settings_icon
+        notebook.prefer_icon = prefer_icon
         notebook.hotel_icon = hotel_icon
         notebook.multicast_icon = multicast_icon
         notebook.subscribe_icon = subscribe_icon
         notebook.online_search_icon = online_search_icon
 
         self.default_ui.init_ui(frame_default)
+        self.prefer_ui.init_ui(frame_prefer)
         self.multicast_ui.init_ui(frame_multicast)
         self.hotel_ui.init_ui(frame_hotel)
         self.subscribe_ui.init_ui(frame_subscribe)
@@ -243,7 +255,7 @@ def get_root_location(root):
     screen_width = root.winfo_screenwidth()
     screen_height = root.winfo_screenheight()
     width = 550
-    height = 720
+    height = 750
     x = (screen_width / 2) - (width / 2)
     y = (screen_height / 2) - (height / 2)
     return (width, height, x, y)
@@ -257,5 +269,5 @@ if __name__ == "__main__":
     screen_height = root.winfo_screenheight()
     root.geometry("%dx%d+%d+%d" % get_root_location(root))
     root.iconbitmap(resource_path("static/images/favicon.ico"))
-    root.after(0, copy_config)
+    root.after(0, config.copy)
     root.mainloop()
